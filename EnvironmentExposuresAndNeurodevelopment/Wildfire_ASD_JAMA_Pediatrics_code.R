@@ -12,9 +12,6 @@ library(splines)
 ############################################################
 ## 0) READ DATA AND CHECK REQUIRED FIELDS
 ############################################################
-## One row per eligible mother-child observation. Cohort assembly,
-## exposure linkage and outcome ascertainment precede this script.
-## Edit these two paths for the approved analysis environment.
 
 input_file <- "data/data_wild2_excl.rds"
 output_dir <- "results/wildfire_analysis"
@@ -121,9 +118,6 @@ data_wild2_excl$region <- factor(data_wild2_excl$region, levels = region_levels)
 ############################################################
 ## 3) DEFINE REVERSED EXPOSURE MATRICES ONCE
 ############################################################
-## Select columns by name rather than position. Preserve the original
-## reversed order: gsPM_33 is modeled lag 1 in the 33-week analysis.
-## Confirm suffix chronology against the exposure data dictionary.
 
 build_exposures <- function(data, lag_max) {
   wild_names <- paste0("gsPM_", lag_max:1)
@@ -197,12 +191,12 @@ extract_cumHR <- function(predLG) {
 }
 result_row <- function(fit, outcome, analysis) {
   data.frame(outcome = outcome, analysis = analysis, N = fit$n,
-    events = fit$events, person_periods = fit$periods,
-    exposure = c("wildfire", "background"), reference = 0,
-    IQR = c(fit$IQR_wild, fit$IQR_bg),
-    HR = c(fit$cumHR["HR"], fit$bgHR["HR"]),
-    LCL = c(fit$cumHR["LCL"], fit$bgHR["LCL"]),
-    UCL = c(fit$cumHR["UCL"], fit$bgHR["UCL"]), row.names = NULL)
+             events = fit$events, person_periods = fit$periods,
+             exposure = c("wildfire", "background"), reference = 0,
+             IQR = c(fit$IQR_wild, fit$IQR_bg),
+             HR = c(fit$cumHR["HR"], fit$bgHR["HR"]),
+             LCL = c(fit$cumHR["LCL"], fit$bgHR["LCL"]),
+             UCL = c(fit$cumHR["UCL"], fit$bgHR["UCL"]), row.names = NULL)
 }
 save_table <- function(rows, filename) {
   table <- do.call(rbind, rows)
@@ -261,7 +255,7 @@ fit_overall <- function(fu_var, ev_var, data, exp_wild_mat, exp_bg_mat,
   if (any(!is.finite(as.matrix(dat[c(".start", ".stop", ".event", ".weight")]))) ||
       any(dat$.start < 0 | dat$.stop <= dat$.start | dat$.weight <= 0) ||
       any(!dat$.event %in% c(0, 1))) stop("Invalid survival intervals.")
-
+  
   ## Construct each basis once per child, then expand for split follow-up.
   rows <- unique(dat$.row_index)
   lag_max <- ncol(exp_wild_mat)
@@ -286,7 +280,7 @@ fit_overall <- function(fu_var, ev_var, data, exp_wild_mat, exp_bg_mat,
   index <- match(dat$.row_index, rows)
   cb_wild <- expand_basis(cb_wild, index)
   cb_bg <- expand_basis(cb_bg, index)
-
+  
   formula <- as.formula(paste(
     "Surv(.start, .stop, .event) ~ cb_wild + cb_bg +",
     "strata(birth_yr) + strata(FIPS) +", paste(covariates, collapse = " + ")
@@ -297,7 +291,7 @@ fit_overall <- function(fu_var, ev_var, data, exp_wild_mat, exp_bg_mat,
                x = FALSE, y = FALSE, model = FALSE)
   if (any(!is.finite(coef(mod)))) stop("Nonfinite model coefficients.")
   if (!predictions) return(list(AIC = AIC(mod)))
-
+  
   predLG <- crosspred(cb_wild, model = mod, cen = 0, at = IQR_wild)
   predBG <- crosspred(cb_bg, model = mod, cen = 0, at = IQR_bg)
   predER <- crosspred(cb_wild, model = mod, cen = 0,
@@ -305,7 +299,7 @@ fit_overall <- function(fu_var, ev_var, data, exp_wild_mat, exp_bg_mat,
   cumHR <- extract_cumHR(predLG)
   bgHR <- extract_cumHR(predBG)
   if (any(!is.finite(c(cumHR, bgHR)))) stop("Nonfinite model predictions.")
-
+  
   list(predER = predER, predLG = predLG, cumHR = cumHR, bgHR = bgHR,
        n = length(rows), events = sum(dat$.event), periods = nrow(dat),
        IQR_wild = IQR_wild, IQR_bg = IQR_bg, AIC = AIC(mod),
@@ -399,7 +393,7 @@ region_rows <- list()
 for (i in seq_len(nrow(outcomes))) {
   for (rg in region_levels) {
     key <- paste(outcomes$name[i], rg, sep = "_")
-    results_region[[key]] <- fit_group_strat(outcomes$fu[i], outcomes$ev[i], "region4", rg)
+    results_region[[key]] <- fit_group_strat(outcomes$fu[i], outcomes$ev[i], "region", rg)
     region_rows[[key]] <- result_row(results_region[[key]], outcomes$name[i], rg)
   }
 }
@@ -468,24 +462,24 @@ descriptives <- function(d,outdir) {
   # Pregnancy-average exposures for descriptive summaries.
   threshold <- median(d$pregnancy_wildfire_mean,na.rm=TRUE)
   groups <- list(Total=seq_len(nrow(d)),Low=which(d$pregnancy_wildfire_mean<=threshold),
-                High=which(d$pregnancy_wildfire_mean>threshold))
+                 High=which(d$pregnancy_wildfire_mean>threshold))
   continuous <- c('Age','medhouseholdincome','education','nearest_hospital_km',
                   'pregnancy_wildfire_mean','pregnancy_background_mean','poverty')
-  categorical <- c('Infant_Gender_Male','race_factor','region4','UA')
+  categorical <- c('Infant_Gender_Male','race_factor','region','UA')
   rows <- list()
   for(g in names(groups)) {
     a <- d[groups[[g]],,drop=FALSE]
     rows[[length(rows)+1L]] <- data.frame(group=g,variable='N',level='',n=nrow(a),missing=0,
-                                        mean=NA_real_,sd=NA_real_,percent=NA_real_)
+                                          mean=NA_real_,sd=NA_real_,percent=NA_real_)
     for(v in continuous) {
       x<-a[[v]]
       rows[[length(rows)+1L]] <- data.frame(group=g,variable=v,level='',n=sum(!is.na(x)),
-        missing=sum(is.na(x)),mean=mean(x,na.rm=TRUE),sd=sd(x,na.rm=TRUE),percent=NA_real_)
+                                            missing=sum(is.na(x)),mean=mean(x,na.rm=TRUE),sd=sd(x,na.rm=TRUE),percent=NA_real_)
     }
     for(v in categorical) for(l in unique(as.character(d[[v]][!is.na(d[[v]])]))) {
       x<-a[[v]];n<-sum(x==l,na.rm=TRUE)
       rows[[length(rows)+1L]] <- data.frame(group=g,variable=v,level=l,n=n,
-        missing=sum(is.na(x)),mean=NA_real_,sd=NA_real_,percent=100*n/sum(!is.na(x)))
+                                            missing=sum(is.na(x)),mean=NA_real_,sd=NA_real_,percent=100*n/sum(!is.na(x)))
     }
   }
   write.csv(do.call(rbind,rows),file.path(outdir,'table1_long.csv'),row.names=FALSE)
@@ -497,10 +491,10 @@ descriptives <- function(d,outdir) {
     for(status in c(0,1)) {
       x<-tt[which(ev==status)]/365.25
       follows[[length(follows)+1L]]<-data.frame(outcome=o,status=status,metric='analysis_time',
-        n=sum(!is.na(x)),mean_years=mean(x,na.rm=TRUE),sd_years=sd(x,na.rm=TRUE),median_years=median(x,na.rm=TRUE))
+                                                n=sum(!is.na(x)),mean_years=mean(x,na.rm=TRUE),sd_years=sd(x,na.rm=TRUE),median_years=median(x,na.rm=TRUE))
       x<-d$Infant_length_enrollment[which(ev==status)]/365.25
       follows[[length(follows)+1L]]<-data.frame(outcome=o,status=status,metric='total_enrollment',
-        n=sum(!is.na(x)),mean_years=mean(x,na.rm=TRUE),sd_years=sd(x,na.rm=TRUE),median_years=median(x,na.rm=TRUE))
+                                                n=sum(!is.na(x)),mean_years=mean(x,na.rm=TRUE),sd_years=sd(x,na.rm=TRUE),median_years=median(x,na.rm=TRUE))
     }
     for(sample in 'full_cohort') {
       k<-!is.na(tt)&!is.na(ev)
@@ -509,7 +503,7 @@ descriptives <- function(d,outdir) {
       # No extrapolation to age 8 if not supported by observed follow-up.
       ss<-summary(sf,times=8*365.25,extend=FALSE)
       if(length(ss$surv)) km[[length(km)+1L]]<-data.frame(outcome=o,sample=sample,
-        age=8,incidence=1-ss$surv,lower=1-ss$upper,upper=1-ss$lower,n_risk=ss$n.risk)
+                                                          age=8,incidence=1-ss$surv,lower=1-ss$upper,upper=1-ss$lower,n_risk=ss$n.risk)
     }
   }
   write.csv(do.call(rbind,follows),file.path(outdir,'followup_metrics.csv'),row.names=FALSE)
@@ -562,7 +556,7 @@ for (lag_max in c(28L, 37L)) {
   for (i in seq_len(nrow(outcomes))) {
     key <- paste(outcomes$name[i], lag_max, "weeks", sep = "_")
     results_lag[[key]] <- fit_overall(outcomes$fu[i], outcomes$ev[i], data_wild2_excl,
-      exp_window$wild, exp_window$bg, iqr_wild, iqr_bg)
+                                      exp_window$wild, exp_window$bg, iqr_wild, iqr_bg)
     lag_rows[[key]] <- result_row(results_lag[[key]], outcomes$name[i], paste0(lag_max, "_weeks"))
   }
 }
@@ -582,7 +576,7 @@ for (i in seq_len(nrow(outcomes))) {
     keep <- which(event == 0 | (event == 1 & t > age * 365.25))
     key <- paste(outcomes$name[i], "after_age", age, sep = "_")
     results_age[[key]] <- fit_overall(outcomes$fu[i], outcomes$ev[i],
-      data_wild2_excl[keep, , drop = FALSE], revexp_s3, revexp_ds3, IQR_wild, IQR_bg)
+                                      data_wild2_excl[keep, , drop = FALSE], revexp_s3, revexp_ds3, IQR_wild, IQR_bg)
     age_rows[[key]] <- result_row(results_age[[key]], outcomes$name[i], paste0("After_age_", age))
   }
 }
@@ -598,7 +592,7 @@ linear_rows <- list()
 for (i in seq_len(nrow(outcomes))) {
   nm <- outcomes$name[i]
   results_linear[[nm]] <- fit_overall(outcomes$fu[i], outcomes$ev[i], data_wild2_excl,
-    revexp_s3, revexp_ds3, IQR_wild, IQR_bg, linear = TRUE)
+                                      revexp_s3, revexp_ds3, IQR_wild, IQR_bg, linear = TRUE)
   linear_rows[[nm]] <- result_row(results_linear[[nm]], nm, "Linear")
 }
 linear_table <- save_table(linear_rows, "linear_sensitivity.csv")
@@ -615,7 +609,7 @@ minimal_rows <- list()
 for (i in seq_len(nrow(outcomes))) {
   nm <- outcomes$name[i]
   results_minimal[[nm]] <- fit_overall(outcomes$fu[i], outcomes$ev[i], data_wild2_excl,
-    revexp_s3, revexp_ds3, IQR_wild, IQR_bg, covariates = minimal_covariates)
+                                       revexp_s3, revexp_ds3, IQR_wild, IQR_bg, covariates = minimal_covariates)
   minimal_rows[[nm]] <- result_row(results_minimal[[nm]], nm, "Minimal")
 }
 minimal_table <- save_table(minimal_rows, "minimal_model.csv")
@@ -635,7 +629,7 @@ estimate_ipcw <- function(data, time, event, denominator_covariates) {
   d$.time <- d[[time]]
   d$.censored <- 1L - d[[event]]
   d$.stratum <- interaction(d$birth_yr, d$FIPS, drop = TRUE, lex.order = TRUE)
-
+  
   # 2. Fit numerator and denominator models for the censoring hazard.
   fit_censor <- function(predictors) {
     f <- reformulate(c('strata(.stratum)', predictors),
@@ -650,10 +644,10 @@ estimate_ipcw <- function(data, time, event, denominator_covariates) {
     numerator <- fit_censor(character(0))
     denominator <- fit_censor(denominator_covariates)
   }
-
+  
   # 3. Split follow-up at outcome event times within each outcome stratum.
   subjects <- data.frame(row_index = d$.row_index, position = seq_len(nrow(d)),
-    tstop = d$.time, event = d[[event]], stratum = d$.stratum)
+                         tstop = d$.time, event = d[[event]], stratum = d$.stratum)
   pieces <- split(subjects, subjects$stratum, drop = TRUE)
   total_rows <- 0
   for (k in seq_along(pieces)) {
@@ -662,13 +656,13 @@ estimate_ipcw <- function(data, time, event, denominator_covariates) {
     total_rows <- total_rows + sum(findInterval(z$tstop, cuts) + !z$tstop %in% cuts)
     if (total_rows > 20000000) stop('Risk-set expansion exceeds 20 million rows; review available memory.')
     z <- if (length(cuts)) survSplit(Surv(tstop, event) ~ ., data = z, cut = cuts,
-                                    start = 'tstart') else transform(z, tstart = 0)
+                                     start = 'tstart') else transform(z, tstart = 0)
     z$used <- z$tstop %in% cuts
     pieces[[k]] <- z
   }
   intervals <- do.call(rbind, pieces)
   stopifnot(sum(intervals$event) == sum(d[[event]]), any(intervals$used))
-
+  
   # 4. Calculate log G(t-) using each child's censoring stratum.
   # Centered baseline hazards and fitted linear predictors use the same reference.
   log_G <- function(fit) {
@@ -696,7 +690,7 @@ estimate_ipcw <- function(data, time, event, denominator_covariates) {
   if (any(!is.finite(intervals$weight) | intervals$weight <= 0)) {
     stop('Invalid weights; inspect censoring models and positivity.')
   }
-
+  
   # 5. Summarize weights at outcome risk sets. ESS is calculated within each set.
   used <- intervals$used
   w <- intervals$weight[used]
@@ -706,12 +700,12 @@ estimate_ipcw <- function(data, time, event, denominator_covariates) {
   ess_fraction <- sums[, 'w']^2 / (sums[, 'n'] * sums[, 'w2'])
   q <- quantile(w, c(0, .5, .95, .99, 1), names = FALSE)
   diagnostics <- data.frame(N = nrow(d), events = sum(d[[event]]),
-    censored = sum(d$.censored), risk_set_memberships = length(w), mean = mean(w),
-    CV = if (length(w) > 1L) sd(w / mean(w)) else 0,
-    min = q[1], median = q[2], p95 = q[3], p99 = q[4], max = q[5],
-    min_G = exp(min(log_den[used])), proportion_G_below_001 = mean(log_den[used] < log(.01)),
-    min_riskset_ESS_fraction = min(ess_fraction),
-    median_riskset_ESS_fraction = median(ess_fraction))
+                            censored = sum(d$.censored), risk_set_memberships = length(w), mean = mean(w),
+                            CV = if (length(w) > 1L) sd(w / mean(w)) else 0,
+                            min = q[1], median = q[2], p95 = q[3], p99 = q[4], max = q[5],
+                            min_G = exp(min(log_den[used])), proportion_G_below_001 = mean(log_den[used] < log(.01)),
+                            min_riskset_ESS_fraction = min(ess_fraction),
+                            median_riskset_ESS_fraction = median(ess_fraction))
   if (any(log_den[used] < log(.01))) warning('Some G(t-) values are below 0.01; review positivity.')
   list(intervals = intervals[c('row_index', 'tstart', 'tstop', 'event', 'weight')],
        diagnostics = diagnostics)
@@ -723,17 +717,17 @@ for (i in seq_len(nrow(outcomes))) {
   nm <- outcomes$name[i]
   censor_covariates <- c(full_covariates, 'Infant_Gender_Male', 'poverty')
   dat <- analytic_sample(data_wild2_excl, revexp_s3, revexp_ds3,
-    outcomes$fu[i], outcomes$ev[i], covariates = censor_covariates)
+                         outcomes$fu[i], outcomes$ev[i], covariates = censor_covariates)
   cw <- crossbasis(revexp_s3[dat$.row_index, , drop = FALSE], lag = c(1, 33),
-    argvar = list(fun = 'ns', df = 3), arglag = list(fun = 'ns', df = 2))
+                   argvar = list(fun = 'ns', df = 3), arglag = list(fun = 'ns', df = 2))
   cb <- crossbasis(revexp_ds3[dat$.row_index, , drop = FALSE], lag = c(1, 33),
-    argvar = list(fun = 'lin'), arglag = list(fun = 'ns', df = 2))
+                   argvar = list(fun = 'lin'), arglag = list(fun = 'ns', df = 2))
   wild_terms <- paste0('.ipcw_w', seq_len(ncol(cw)))
   bg_terms <- paste0('.ipcw_b', seq_len(ncol(cb)))
   censor_data <- cbind(dat, setNames(as.data.frame(cw), wild_terms),
-                      setNames(as.data.frame(cb), bg_terms))
+                       setNames(as.data.frame(cb), bg_terms))
   ipcw <- estimate_ipcw(censor_data, outcomes$fu[i], outcomes$ev[i],
-                       c(censor_covariates, wild_terms, bg_terms))
+                        c(censor_covariates, wild_terms, bg_terms))
   write.csv(ipcw$diagnostics, file.path(output_dir, paste0('IPCW_weights_', nm, '.csv')),
             row.names = FALSE)
   results_compare[[paste0(nm, '_Unweighted')]] <- fit_overall(
@@ -760,12 +754,12 @@ results_maternal <- list()
 maternal_rows <- list()
 for (i in seq_len(nrow(outcomes))) {
   dat <- analytic_sample(data_wild2_excl, revexp_s3, revexp_ds3,
-    outcomes$fu[i], outcomes$ev[i], cluster_var = "mother_cluster")
+                         outcomes$fu[i], outcomes$ev[i], cluster_var = "mother_cluster")
   dat <- analytic_sample(dat, revexp_s3, revexp_ds3, outcomes$fu[i], outcomes$ev[i])
   for (cluster in c("ZIP_Index", "mother_cluster")) {
     key <- paste(outcomes$name[i], cluster, sep = "_")
     results_maternal[[key]] <- fit_overall(outcomes$fu[i], outcomes$ev[i], dat,
-      revexp_s3, revexp_ds3, IQR_wild, IQR_bg, cluster_var = cluster)
+                                           revexp_s3, revexp_ds3, IQR_wild, IQR_bg, cluster_var = cluster)
     maternal_rows[[key]] <- result_row(results_maternal[[key]], outcomes$name[i], cluster)
   }
 }
@@ -788,7 +782,7 @@ as_verified_date <- function(x) {
   out
 }
 icd_intervals <- function(dat, fu_var, ev_var, diagnosis_var) {
-  birth <- as_verified_date(dat$Deliv_Date2)
+  birth <- as_verified_date(dat$Deliv_Date)
   diagnosis <- as_verified_date(dat[[diagnosis_var]])
   time <- dat[[fu_var]]; event <- dat[[ev_var]]
   if (anyNA(birth) || any(event == 1 & is.na(diagnosis))) stop("Missing required ICD dates.")
@@ -802,9 +796,9 @@ icd_intervals <- function(dat, fu_var, ev_var, diagnosis_var) {
   }
   boundary <- as.numeric(transition - birth)
   pre <- data.frame(row_index = dat$.row_index, tstart = 0, tstop = pmin(time, boundary),
-    event = as.integer(event == 1 & diagnosis < transition), weight = 1, era = "ICD9")
+                    event = as.integer(event == 1 & diagnosis < transition), weight = 1, era = "ICD9")
   post <- data.frame(row_index = dat$.row_index, tstart = pmax(0, boundary), tstop = time,
-    event = as.integer(event == 1 & diagnosis >= transition), weight = 1, era = "ICD10")
+                     event = as.integer(event == 1 & diagnosis >= transition), weight = 1, era = "ICD10")
   intervals <- rbind(pre, post)
   intervals$event[is.na(intervals$event)] <- 0L
   intervals <- intervals[intervals$tstop > intervals$tstart, , drop = FALSE]
@@ -824,7 +818,7 @@ for (i in seq_len(nrow(outcomes))) {
     key <- paste(outcomes$name[i], era, sep = "_")
     era_intervals <- intervals[intervals$era == era, , drop = FALSE]
     results_icd[[key]] <- fit_overall(outcomes$fu[i], outcomes$ev[i], dat,
-      revexp_s3, revexp_ds3, IQR_wild, IQR_bg, intervals = era_intervals)
+                                      revexp_s3, revexp_ds3, IQR_wild, IQR_bg, intervals = era_intervals)
     icd_rows[[key]] <- result_row(results_icd[[key]], outcomes$name[i], era)
   }
 }
@@ -850,24 +844,22 @@ for (nm in outcomes$name) {
   hr <- res_overall[[nm]]$cumHR
   value <- evalue(hr["HR"], hr["LCL"], hr["UCL"])
   evalue_rows[[nm]] <- data.frame(outcome = nm, HR = unname(hr["HR"]),
-    LCL = unname(hr["LCL"]), UCL = unname(hr["UCL"]),
-    E_value = unname(value["estimate"]), E_value_CI = unname(value["CI"]))
+                                  LCL = unname(hr["LCL"]), UCL = unname(hr["UCL"]),
+                                  E_value = unname(value["estimate"]), E_value_CI = unname(value["CI"]))
 }
 evalue_table <- save_table(evalue_rows, "E_values.csv")
 
 ############################################################
 ## 30) SAVE SENSITIVITY SUMMARY AND SOFTWARE VERSIONS
 ############################################################
-## Export aggregate tables and spline settings. Participant records,
-## identifiers, dates and fitted model objects are not written to disk.
 
 sensitivity_summary <- rbind(lag_table, age_table, linear_table, minimal_table,
-                              comparison_table, maternal_table, icd_table)
+                             comparison_table, maternal_table, icd_table)
 write.csv(sensitivity_summary, file.path(output_dir, "sensitivity_results.csv"), row.names = FALSE)
 all_results <- list(overall = res_overall, sex = results_sex, race = results_race,
-  region = results_region, windows = results_lag, age = results_age,
-  linear = results_linear, minimal = results_minimal, ipcw = results_compare,
-  maternal = results_maternal, icd = results_icd)
+                    region = results_region, windows = results_lag, age = results_age,
+                    linear = results_linear, minimal = results_minimal, ipcw = results_compare,
+                    maternal = results_maternal, icd = results_icd)
 basis_settings <- lapply(all_results, function(group) lapply(group, function(fit) fit$basis))
 dput(basis_settings, file = file.path(output_dir, "basis_settings.txt"))
 capture.output(sessionInfo(), file = file.path(output_dir, "sessionInfo.txt"))
