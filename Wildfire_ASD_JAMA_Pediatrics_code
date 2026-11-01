@@ -622,273 +622,135 @@ minimal_table <- save_table(minimal_rows, "minimal_model.csv")
 plot_results(results_minimal, "minimal_model")
 
 ############################################################
-## 26) IPCW: ACCOUNT FOR LOSS TO FOLLOW-UP
+## 26) IPCW SENSITIVITY ANALYSIS FOR OVERALL CENSORING
 ############################################################
-## 26a. Use the actual endpoint reason: outcome, loss_to_followup,
-##      administrative, or death. Only loss_to_followup is a censoring event.
-## 26b. Fit numerator and denominator censoring models within birth-year/county
-##      strata. Add full covariates, sex, poverty and prenatal exposure bases
-##      to the denominator. Predictors are measured at baseline.
-## 26c. At each outcome event time, calculate G_num(t-)/G_den(t-) using
-##      the correct stratum-specific hazards and consistent centering.
-## 26d. Fit weighted and unweighted outcome models in the same children.
-##      The weighted Cox model uses time-varying weights and ZIP robust SEs.
-## 26e. Save aggregate endpoint counts and weight/positivity diagnostics.
-## This requires conditional independent censoring, positivity and adequate
-## censoring models. Death remains a competing terminal event. Standard errors
-## condition on the estimated weights. No weight caps or probability floors.
-ipcw_check_subjects <- function(data, time, event, reason, predictors, strata_columns) {
-  required <- unique(c('.row_index', time, event, reason, predictors, strata_columns))
-  missing <- setdiff(required, names(data))
-  if (length(missing)) stop('Missing IPCW fields: ', paste(missing, collapse = ', '))
-  if (!nrow(data) || anyNA(data[required])) stop('IPCW sample contains missing inputs.')
-  if (anyDuplicated(data$.row_index)) stop('One baseline record per child is required.')
-  if (!is.numeric(data$.row_index) || any(!is.finite(data$.row_index)) ||
-      any(data$.row_index < 1 | data$.row_index != floor(data$.row_index))) {
-    stop('Invalid in-memory row index.')
-  }
-  tt <- data[[time]]; ee <- data[[event]]
-  if (!is.numeric(tt) || any(!is.finite(tt) | tt <= 0) ||
-      !is.numeric(ee) || any(!ee %in% c(0, 1))) stop('Invalid time/event inputs.')
-  numeric_fields <- required[vapply(data[required], is.numeric, logical(1))]
-  if (any(vapply(data[numeric_fields], function(x) any(!is.finite(x)), logical(1)))) {
-    stop('Nonfinite IPCW predictor.')
-  }
-  rr <- as.character(data[[reason]])
-  allowed <- c('outcome', 'loss_to_followup', 'administrative', 'death')
-  if (any(!rr %in% allowed)) stop('Unknown follow-up reason; use the four documented labels.')
-  if (any((rr == 'outcome') != (ee == 1))) stop('Outcome indicator and exit reason disagree.')
-  as.integer(rr == 'loss_to_followup')
-}
 
-ipcw_build_intervals <- function(row_index, time, event, stratum,
-                                 max_intervals = 20000000) {
+estimate_ipcw <- function(data, time, event, denominator_covariates) {
+  # 1. Prepare one record per child and the birth-year/county strata.
+  needed <- unique(c('.row_index', time, event, 'birth_yr', 'FIPS', denominator_covariates))
+  stopifnot(all(needed %in% names(data)), !anyNA(data[needed]),
+            !anyDuplicated(data$.row_index), all(is.finite(data[[time]])),
+            all(data[[time]] > 0), all(data[[event]] %in% c(0, 1)))
+  d <- data
+  d$.time <- d[[time]]
+  d$.censored <- 1L - d[[event]]
+  d$.stratum <- interaction(d$birth_yr, d$FIPS, drop = TRUE, lex.order = TRUE)
 
-  n <- length(time)
-  if (!n || any(c(length(row_index), length(event), length(stratum)) != n) ||
-      anyNA(c(row_index, time, event, stratum)) || anyDuplicated(row_index) ||
-      any(!is.finite(time) | time <= 0) || any(!event %in% c(0, 1))) {
-    stop('Invalid subjects for risk-set interval construction.')
+  # 2. Fit numerator and denominator models for the censoring hazard.
+  fit_censor <- function(predictors) {
+    f <- reformulate(c('strata(.stratum)', predictors),
+                     response = 'Surv(.time, .censored)')
+    withCallingHandlers(
+      coxph(f, data = d, ties = 'efron', model = TRUE, na.action = na.fail,
+            singular.ok = FALSE),
+      warning = function(w) stop('Censoring model: ', conditionMessage(w)))
   }
-  if (length(max_intervals) != 1L || !is.finite(max_intervals) || max_intervals < n) {
-    stop('max_intervals must accommodate at least one row per child.')
+  numerator <- denominator <- NULL
+  if (any(d$.censored == 1L)) {
+    numerator <- fit_censor(character(0))
+    denominator <- fit_censor(denominator_covariates)
   }
-  groups <- split(seq_len(n), as.character(stratum), drop = TRUE)
-  specifications <- vector('list', length(groups))
-  total <- 0
-  for (g in seq_along(groups)) {
-    ids <- groups[[g]]
-    event_times <- sort(unique(time[ids][event[ids] == 1]))
-    if (length(event_times)) {
-      k <- findInterval(time[ids], event_times)
-      ends_at_event_time <- k > 0 & time[ids] == event_times[pmax(k, 1L)]
-      lengths <- k + as.integer(!ends_at_event_time)
-    } else {
-      k <- integer(length(ids)); lengths <- rep.int(1L, length(ids))
+
+  # 3. Split follow-up at outcome event times within each outcome stratum.
+  subjects <- data.frame(row_index = d$.row_index, position = seq_len(nrow(d)),
+    tstop = d$.time, event = d[[event]], stratum = d$.stratum)
+  pieces <- split(subjects, subjects$stratum, drop = TRUE)
+  total_rows <- 0
+  for (k in seq_along(pieces)) {
+    z <- pieces[[k]]
+    cuts <- sort(unique(z$tstop[z$event == 1L]))
+    total_rows <- total_rows + sum(findInterval(z$tstop, cuts) + !z$tstop %in% cuts)
+    if (total_rows > 20000000) stop('Risk-set expansion exceeds 20 million rows; review available memory.')
+    z <- if (length(cuts)) survSplit(Surv(tstop, event) ~ ., data = z, cut = cuts,
+                                    start = 'tstart') else transform(z, tstart = 0)
+    z$used <- z$tstop %in% cuts
+    pieces[[k]] <- z
+  }
+  intervals <- do.call(rbind, pieces)
+  stopifnot(sum(intervals$event) == sum(d[[event]]), any(intervals$used))
+
+  # 4. Calculate log G(t-) using each child's censoring stratum.
+  # Centered baseline hazards and fitted linear predictors use the same reference.
+  log_G <- function(fit) {
+    if (is.null(fit)) return(rep(0, nrow(intervals)))
+    h <- basehaz(fit, centered = TRUE)
+    labels <- as.character(fit$model[['strata(.stratum)']])
+    if (!'strata' %in% names(h)) h$strata <- unique(labels)
+    curves <- split(h, as.character(h$strata), drop = TRUE)
+    rows <- split(seq_len(nrow(intervals)), labels[intervals$position])
+    lp <- if (length(coef(fit))) fit$linear.predictors else rep(0, nrow(d))
+    stopifnot(all(is.finite(lp)), all(names(rows) %in% names(curves)))
+    answer <- numeric(nrow(intervals))
+    for (s in names(rows)) {
+      j <- rows[[s]]
+      curve <- curves[[s]]
+      before <- findInterval(intervals$tstop[j], curve$time, left.open = TRUE)
+      H0 <- c(0, curve$hazard)[before + 1L]
+      answer[j] <- -exp(log(H0) + lp[intervals$position[j]])
     }
-    total <- total + sum(lengths)
-    if (total > max_intervals || total > .Machine$integer.max) {
-      stop('Exact risk-set expansion exceeds max_intervals. Increase the limit only with sufficient memory.')
-    }
-    specifications[[g]] <- list(ids = ids, times = event_times, k = k, lengths = lengths)
+    if (any(!is.finite(answer))) stop('Invalid censoring survival; inspect model fit.')
+    answer
   }
-  position <- integer(total); tstart <- numeric(total); tstop <- numeric(total)
-  status <- integer(total); at_riskset <- logical(total)
-  offset <- 0L
-  for (spec in specifications) {
-    local <- rep(seq_along(spec$ids), spec$lengths)
-    subject <- spec$ids[local]
-    within <- sequence(spec$lengths)
-    active <- within <= spec$k[local]
-    stop_time <- time[subject]
-    if (any(active)) stop_time[active] <- spec$times[within[active]]
-    start_time <- c(0, head(stop_time, -1L))
-    start_time[within == 1L] <- 0
-    take <- offset + seq_along(subject)
-    position[take] <- subject; tstart[take] <- start_time; tstop[take] <- stop_time
-    status[take] <- as.integer(event[subject] == 1 & stop_time == time[subject])
-    at_riskset[take] <- active
-    offset <- offset + length(subject)
+  log_den <- log_G(denominator)
+  intervals$weight <- exp(log_G(numerator) - log_den)
+  if (any(!is.finite(intervals$weight) | intervals$weight <= 0)) {
+    stop('Invalid weights; inspect censoring models and positivity.')
   }
-  if (any(tstop <= tstart) || sum(status) != sum(event)) stop('Interval construction failed.')
-  data.frame(row_index = row_index[position], tstart = tstart, tstop = tstop,
-             event = status, subject_position = position, at_riskset = at_riskset)
-}
 
-ipcw_hazard_before <- function(curve, time) {
-  # G(t-) excludes censoring jumps AT t. A censoring event on the same day
-  # must not enter the probability used to weight an outcome risk set at t.
-  curve <- curve[order(curve$time), , drop = FALSE]
-  curve <- curve[!duplicated(curve$time, fromLast = TRUE), , drop = FALSE]
-  if (!nrow(curve) || any(!is.finite(curve$time)) ||
-      any(!is.finite(curve$hazard) | curve$hazard < 0) ||
-      any(diff(curve$hazard) < -1e-10)) stop('Invalid cumulative censoring hazard.')
-  index <- findInterval(time, curve$time, left.open = TRUE)
-  c(0, curve$hazard)[index + 1L]
-}
-
-ipcw_prediction_state <- function(fit, n) {
-  # Both pieces use fit$means. Do not mix an uncentered hazard with a
-  # stratum-centered linear predictor.
-  hazard <- survival::basehaz(fit, centered = TRUE)
-  lp <- as.numeric(stats::predict(fit, type = 'lp', reference = 'sample'))
-  labels <- as.character(fit$model[['strata(.ipcw_stratum)']])
-  if (length(lp) != n || length(labels) != n || any(!is.finite(lp))) {
-    stop('Censoring predictions do not align with the complete-case sample.')
-  }
-  if (!'strata' %in% names(hazard)) {
-    if (length(unique(labels)) != 1L) stop('Missing stratum-specific censoring hazards.')
-    hazard$strata <- labels[1]
-  }
-  curves <- split(hazard, as.character(hazard$strata), drop = TRUE)
-  if (!all(labels %in% names(curves))) stop('Censoring hazard strata do not match subject strata.')
-  list(zero = FALSE, lp = lp, labels = labels, curves = curves)
-}
-
-ipcw_log_g <- function(state, position, time) {
-  if (length(position) != length(time) || any(!is.finite(time) | time < 0)) {
-    stop('Invalid censoring-survival query.')
-  }
-  if (isTRUE(state$zero)) return(rep(0, length(time)))
-  if (anyNA(position) || any(position < 1 | position > length(state$lp))) {
-    stop('Invalid subject positions.')
-  }
-  label <- state$labels[position]
-  cumulative <- numeric(length(time))
-  for (s in unique(label)) {
-    take <- which(label == s)
-    cumulative[take] <- ipcw_hazard_before(state$curves[[s]], time[take])
-  }
-  positive <- cumulative > 0
-  log_g <- numeric(length(time))
-  log_g[positive] <- -exp(log(cumulative[positive]) + state$lp[position[positive]])
-  if (any(!is.finite(log_g))) stop('Nonfinite censoring survival: inspect model fit and positivity.')
-  log_g
-}
-
-estimate_ipcw <- function(data, time, event, reason, denominator_covariates) {
-  strata_columns <- c('birth_yr', 'FIPS')
-  denominator_covariates <- unique(denominator_covariates)
-  cc <- ipcw_check_subjects(data, time, event, reason, denominator_covariates, strata_columns)
-  a <- data
-  a$.ipcw_time <- a[[time]]
-  a$.ipcw_censor <- cc
-  a$.ipcw_stratum <- do.call(interaction,
-    c(unname(a[strata_columns]), list(drop = TRUE, lex.order = TRUE)))
-  Surv <- survival::Surv
-  strata <- survival::strata
-  f_num <- stats::as.formula('Surv(.ipcw_time, .ipcw_censor) ~ strata(.ipcw_stratum)')
-  f_den <- stats::reformulate(c('strata(.ipcw_stratum)', denominator_covariates),
-                             response = 'Surv(.ipcw_time, .ipcw_censor)')
-  if (sum(cc) == 0L) {
-    num <- den <- list(zero = TRUE)
-  } else {
-    checked_fit <- function(formula) {
-      fit <- withCallingHandlers(
-        survival::coxph(formula, data = a, ties = 'efron', na.action = stats::na.fail,
-                        singular.ok = FALSE, model = TRUE, x = TRUE, y = TRUE),
-        warning = function(w) stop('Censoring model warning: ', conditionMessage(w), call. = FALSE))
-      if (any(!is.finite(stats::coef(fit)))) stop('Nonfinite censoring-model coefficient.')
-      fit
-    }
-    m_num <- checked_fit(f_num)
-    m_den <- checked_fit(f_den)
-    num <- ipcw_prediction_state(m_num, nrow(a))
-    den <- ipcw_prediction_state(m_den, nrow(a))
-    rm(m_num, m_den)
-  }
-  intervals <- ipcw_build_intervals(a$.row_index, a[[time]], a[[event]],
-                                    a$.ipcw_stratum)
-  log_g_den <- ipcw_log_g(den, intervals$subject_position, intervals$tstop)
-  log_g_num <- ipcw_log_g(num, intervals$subject_position, intervals$tstop)
-  intervals$log_weight <- log_g_num - log_g_den
-  if (any(!is.finite(intervals$log_weight))) stop('Nonfinite log censoring weights.')
-  used <- intervals$at_riskset
-  if (!any(used)) stop('No outcome risk sets in the IPCW sample.')
-  weights <- exp(intervals$log_weight)
-  if (any(!is.finite(weights) | weights <= 0)) {
-    stop('Weights overflow/underflow. Inspect positivity and model fit.')
-  }
-  intervals$weight <- weights
-  w <- weights[used]
-  q <- as.numeric(stats::quantile(w, c(0, .01, .5, .95, .99, 1)))
-  fraction_low <- mean(log_g_den[used] < log(0.01))
-  diagnostics <- data.frame(risk_set_memberships = length(w), mean = mean(w),
-    min = q[1], p01 = q[2], median = q[3], p95 = q[4], p99 = q[5], max = q[6],
-    min_G = exp(min(log_g_den[used])), proportion_G_below_001 = fraction_low)
-  if (fraction_low > 0) warning(sprintf(
-    '%.3f%% of outcome risk-set memberships have G(t-) below 0.01. Review positivity and model fit.',
-    100 * fraction_low))
-  endpoint_counts <- as.data.frame(table(factor(as.character(a[[reason]]),
-    levels = c('outcome', 'loss_to_followup', 'administrative', 'death'))))
-  names(endpoint_counts) <- c('exit_reason', 'N')
+  # 5. Summarize weights at outcome risk sets. ESS is calculated within each set.
+  used <- intervals$used
+  w <- intervals$weight[used]
+  riskset <- paste(intervals$stratum[used], intervals$tstop[used], sep = ':')
+  scaled <- w / ave(w, riskset, FUN = max)
+  sums <- rowsum(cbind(n = 1, w = scaled, w2 = scaled^2), riskset, reorder = FALSE)
+  ess_fraction <- sums[, 'w']^2 / (sums[, 'n'] * sums[, 'w2'])
+  q <- quantile(w, c(0, .5, .95, .99, 1), names = FALSE)
+  diagnostics <- data.frame(N = nrow(d), events = sum(d[[event]]),
+    censored = sum(d$.censored), risk_set_memberships = length(w), mean = mean(w),
+    CV = if (length(w) > 1L) sd(w / mean(w)) else 0,
+    min = q[1], median = q[2], p95 = q[3], p99 = q[4], max = q[5],
+    min_G = exp(min(log_den[used])), proportion_G_below_001 = mean(log_den[used] < log(.01)),
+    min_riskset_ESS_fraction = min(ess_fraction),
+    median_riskset_ESS_fraction = median(ess_fraction))
+  if (any(log_den[used] < log(.01))) warning('Some G(t-) values are below 0.01; review positivity.')
   list(intervals = intervals[c('row_index', 'tstart', 'tstop', 'event', 'weight')],
-       diagnostics = diagnostics, endpoint_counts = endpoint_counts,
-       settings = list(numerator = paste(deparse(f_num), collapse = ' '),
-         denominator = paste(deparse(f_den), collapse = ' '), strata = strata_columns,
-         predictors = 'Baseline covariates and prenatal exposure cross-basis terms',
-         censoring_event = 'Loss to follow-up only',
-         death_handling = 'Competing terminal event; not weighted as loss to follow-up',
-         evaluation = 'G(t-) at each outcome event time within the outcome stratum'))
+       diagnostics = diagnostics)
 }
 
-ipcw_validate_intervals <- function(intervals, data, time, event) {
-  z <- intervals[order(intervals$row_index, intervals$tstart), , drop = FALSE]
-  if (!nrow(z) || anyNA(z) || any(!is.finite(as.matrix(z))) ||
-      any(z$tstop <= z$tstart | z$tstart < 0 | z$weight <= 0) ||
-      any(!z$event %in% c(0, 1))) stop('Invalid weighted follow-up intervals.')
-  first <- c(TRUE, diff(z$row_index) != 0)
-  last <- c(diff(z$row_index) != 0, TRUE)
-  if (any(z$tstart[first] != 0)) stop('Follow-up intervals must start at birth.')
-  subsequent <- which(!first)
-  if (length(subsequent) && any(z$tstart[subsequent] != z$tstop[subsequent - 1L])) {
-    stop('Follow-up intervals contain a gap or overlap.')
-  }
-  if (!setequal(z$row_index, data$.row_index)) stop('Weighted and unweighted samples differ.')
-  match_last <- match(z$row_index[last], data$.row_index)
-  if (any(z$tstop[last] != data[[time]][match_last]) ||
-      any(z$event[!last] != 0) || any(z$event[last] != data[[event]][match_last])) {
-    stop('Weighted follow-up or events do not match the original sample.')
-  }
-  invisible(TRUE)
-}
-
-results_compare <- list()
-comparison_rows <- list()
+# 6. Fit the unweighted and weighted DLNMs in the same complete-case sample.
+results_compare <- comparison_rows <- list()
 for (i in seq_len(nrow(outcomes))) {
   nm <- outcomes$name[i]
-  censor_covariates <- c(full_covariates, "Infant_Gender_Male", "poverty")
+  censor_covariates <- c(full_covariates, 'Infant_Gender_Male', 'poverty')
   dat <- analytic_sample(data_wild2_excl, revexp_s3, revexp_ds3,
-                         outcomes$fu[i], outcomes$ev[i], covariates = censor_covariates)
+    outcomes$fu[i], outcomes$ev[i], covariates = censor_covariates)
   cw <- crossbasis(revexp_s3[dat$.row_index, , drop = FALSE], lag = c(1, 33),
-                   argvar = list(fun = "ns", df = 3), arglag = list(fun = "ns", df = 2))
+    argvar = list(fun = 'ns', df = 3), arglag = list(fun = 'ns', df = 2))
   cb <- crossbasis(revexp_ds3[dat$.row_index, , drop = FALSE], lag = c(1, 33),
-                   argvar = list(fun = "lin"), arglag = list(fun = "ns", df = 2))
-  wild_terms <- paste0(".ipcw_w", seq_len(ncol(cw)))
-  bg_terms <- paste0(".ipcw_b", seq_len(ncol(cb)))
-  censor_data <- dat
-  for (j in seq_along(wild_terms)) censor_data[[wild_terms[j]]] <- cw[, j]
-  for (j in seq_along(bg_terms)) censor_data[[bg_terms[j]]] <- cb[, j]
-  ipcw <- estimate_ipcw(censor_data, time = outcomes$fu[i], event = outcomes$ev[i],
-    reason = outcomes$exit[i], denominator_covariates = c(censor_covariates, wild_terms, bg_terms))
-  ipcw_validate_intervals(ipcw$intervals, dat, outcomes$fu[i], outcomes$ev[i])
-  write.csv(ipcw$diagnostics, file.path(output_dir, paste0("IPCW_weights_", nm, ".csv")), row.names = FALSE)
-  write.csv(ipcw$endpoint_counts, file.path(output_dir, paste0("IPCW_endpoints_", nm, ".csv")), row.names = FALSE)
-  dput(ipcw$settings, file = file.path(output_dir, paste0("IPCW_settings_", nm, ".txt")))
-
-  results_compare[[paste0(nm, "_Unweighted")]] <- fit_overall(
+    argvar = list(fun = 'lin'), arglag = list(fun = 'ns', df = 2))
+  wild_terms <- paste0('.ipcw_w', seq_len(ncol(cw)))
+  bg_terms <- paste0('.ipcw_b', seq_len(ncol(cb)))
+  censor_data <- cbind(dat, setNames(as.data.frame(cw), wild_terms),
+                      setNames(as.data.frame(cb), bg_terms))
+  ipcw <- estimate_ipcw(censor_data, outcomes$fu[i], outcomes$ev[i],
+                       c(censor_covariates, wild_terms, bg_terms))
+  write.csv(ipcw$diagnostics, file.path(output_dir, paste0('IPCW_weights_', nm, '.csv')),
+            row.names = FALSE)
+  results_compare[[paste0(nm, '_Unweighted')]] <- fit_overall(
     outcomes$fu[i], outcomes$ev[i], dat, revexp_s3, revexp_ds3, IQR_wild, IQR_bg)
-  results_compare[[paste0(nm, "_IPCW")]] <- fit_overall(
+  results_compare[[paste0(nm, '_IPCW')]] <- fit_overall(
     outcomes$fu[i], outcomes$ev[i], dat, revexp_s3, revexp_ds3, IQR_wild, IQR_bg,
     intervals = ipcw$intervals)
-  for (type in c("Unweighted", "IPCW")) {
-    key <- paste(nm, type, sep = "_")
-    comparison_rows[[key]] <- result_row(results_compare[[key]], nm, paste0("IPCW_", type))
+  for (type in c('Unweighted', 'IPCW')) {
+    key <- paste(nm, type, sep = '_')
+    comparison_rows[[key]] <- result_row(results_compare[[key]], nm, paste0('IPCW_', type))
   }
   rm(censor_data, dat, cw, cb, ipcw)
 }
-comparison_table <- save_table(comparison_rows, "main_vs_ipcw_comparison.csv")
-plot_results(results_compare, "unweighted_vs_IPCW")
+
+# 7. Save the HR comparison and the DLNM exposure-response and lag-response plots.
+comparison_table <- save_table(comparison_rows, 'main_vs_ipcw_comparison.csv')
+plot_results(results_compare, 'unweighted_vs_IPCW')
 
 ############################################################
 ## 27) MATERNAL CLUSTERING FOR REPEATED PREGNANCIES
